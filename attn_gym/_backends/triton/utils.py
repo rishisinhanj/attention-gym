@@ -29,6 +29,14 @@ def configure_triton_allocator() -> None:
         )
 
 
+def reflect_ftz_option(fastmath: bool) -> dict[str, bool]:
+    """Return the launch option that gives libdevice the ``FASTMATH`` flush-to-zero policy.
+
+    The option is NVVM-only: Triton's HIP backend rejects it as an unrecognised keyword.
+    """
+    return {} if torch.version.hip else {"enable_reflect_ftz": fastmath}
+
+
 @triton.jit
 def exp2(x, FASTMATH: tl.constexpr = True):
     """Select approximate or libdevice exp2.
