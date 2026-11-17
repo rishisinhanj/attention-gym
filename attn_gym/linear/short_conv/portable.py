@@ -39,6 +39,7 @@ from attn_gym.linear.short_conv.common import (
     ShortConvKernelOptions,
     ShortConvTunedConfig,
     final_conv_state,
+    packed_positions,
 )
 from attn_gym.types import validate_kernel_options
 
@@ -224,21 +225,6 @@ def _reject_autograd(name: str, *tensors: torch.Tensor) -> None:
         )
 
 
-def _packed_positions(
-    cu_seqlens: torch.Tensor, tokens: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return each physical token's packed sequence, offset in it, and whether it is active.
-
-    Repeated offsets (empty sequences) own no token. Tokens at or past the active endpoint
-    ``cu_seqlens[-1]`` are inactive and assigned to the last sequence.
-    """
-    positions = torch.arange(tokens, device=cu_seqlens.device, dtype=cu_seqlens.dtype)
-    sequence = torch.searchsorted(cu_seqlens[1:], positions, right=True)
-    sequence = sequence.clamp_(max=cu_seqlens.shape[0] - 2)
-    offset = positions.long() - cu_seqlens[sequence].long()
-    return sequence, offset, positions < cu_seqlens[-1]
-
-
 def _preactivation(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -250,7 +236,7 @@ def _preactivation(
 
     ``initial_state`` ``[N, W - 1, C]`` (zeros when ``None``) holds the history before each
     sequence: every batch row, or every ``cu_seqlens`` interval of the single packed row.
-    ``positions`` is ``_packed_positions(cu_seqlens, T)`` when the caller already has it.
+    ``positions`` is ``packed_positions(cu_seqlens, T)`` when the caller already has it.
     """
     tokens, width = x.shape[1], weight.shape[1]
     taps = weight.float()
@@ -266,7 +252,7 @@ def _preactivation(
             output = output + window[:, tap : tap + tokens] * taps[:, tap]
         return output
 
-    sequence, offset, active = positions or _packed_positions(cu_seqlens, tokens)
+    sequence, offset, active = positions or packed_positions(cu_seqlens, tokens)
     # Inactive tokens read zeros, so a NaN suffix reaches neither outputs nor gradients.
     active = active[:, None]
     padded = F.pad(x[0].float(), (0, 0, width - 1, 0))
@@ -319,7 +305,11 @@ def causal_conv1d(
         raise ValueError("persistent TMA input gradients require packed cu_seqlens")
     width = weight.shape[1]
     history = None if width == 1 else initial_state
-    output = epilogue(_preactivation(x, weight, cu_seqlens, history)).to(x.dtype)
+    # The Triton grid puts dense rows on its z axis, which holds at most 65535 blocks.
+    if _triton_kernels is not None and x.is_cuda and x.shape[0] <= 65535:
+        output = _triton_kernels.short_conv_forward(x, weight, cu_seqlens, history, activation)
+    else:
+        output = epilogue(_preactivation(x, weight, cu_seqlens, history)).to(x.dtype)
     if initial_state is not None and width == 1:
         output = output + initial_state.sum()
     if not return_final_state:
@@ -355,7 +345,7 @@ def paged_causal_conv1d(
     history = state_cache[slots]
     resumed = live if has_initial_state is None else live & has_initial_state
     initial_state = torch.where(resumed[:, None, None], history, 0)
-    positions = None if cu_seqlens is None else _packed_positions(cu_seqlens, tokens)
+    positions = None if cu_seqlens is None else packed_positions(cu_seqlens, tokens)
     # The Triton grid puts dense rows on its z axis, which holds at most 65535 blocks.
     if _triton_kernels is not None and x.is_cuda and x.shape[0] <= 65535:
         output = _triton_kernels.causal_conv1d_forward(

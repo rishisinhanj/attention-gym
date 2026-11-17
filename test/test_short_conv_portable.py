@@ -31,8 +31,8 @@ RELATIVE_BUDGET = {torch.float16: 2e-3, torch.bfloat16: 1e-2, torch.float32: 1e-
 
 
 @pytest.fixture(params=["torch", "triton"])
-def stateful_impl(request, monkeypatch):
-    """Run paged prefill and decode through the PyTorch path or the GPU path's Triton kernels."""
+def impl(request, monkeypatch):
+    """Run every operation through the PyTorch path or the GPU path's Triton kernels."""
     if request.param == "torch":
         monkeypatch.setattr(portable, "_triton_kernels", None)
     elif DEVICE != "cuda" or portable._triton_kernels is None:
@@ -134,7 +134,7 @@ def test_lazy_exports_prefers_the_first_importable_owner():
         (5, 2, 3, "silu"),
     ],
 )
-def test_dense_forward_and_backward_match_reference(width, batch, tokens, activation, dtype):
+def test_dense_forward_and_backward_match_reference(width, batch, tokens, activation, dtype, impl):
     torch.manual_seed(0)
     x, weight = _inputs(batch, tokens, 12, width, dtype)
     grad_output = torch.randn_like(x)
@@ -150,7 +150,7 @@ def test_dense_forward_and_backward_match_reference(width, batch, tokens, activa
         _assert_close_relative(actual_grad, expected_grad, dtype)
 
 
-def test_strided_input_matches_contiguous_copy():
+def test_strided_input_matches_contiguous_copy(impl):
     """Column slices of a fused projection are read in place and give identical bits."""
     torch.manual_seed(1)
     base = torch.randn(1, 40, 3 * 16, device=DEVICE, dtype=torch.bfloat16)
@@ -164,7 +164,7 @@ def test_strided_input_matches_contiguous_copy():
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("width", [1, 4, 5])
-def test_packed_documents_match_independent_sequences(width, dtype):
+def test_packed_documents_match_independent_sequences(width, dtype, impl):
     """Per-document resets, length-1 and empty documents, and a NaN suffix past the endpoint."""
     torch.manual_seed(2)
     boundaries = [0, 1, 64, 64, 129, 130, 131, 133, 433]
@@ -192,7 +192,7 @@ def test_packed_documents_match_independent_sequences(width, dtype):
 
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("width", [1, 4])
-def test_initial_and_final_state_with_gradients(packed, width):
+def test_initial_and_final_state_with_gradients(packed, width, impl):
     torch.manual_seed(3)
     dtype = torch.float32
     if packed:
@@ -237,6 +237,53 @@ def test_initial_and_final_state_with_gradients(packed, width):
             _assert_close_relative(actual_grad, expected_grad, dtype)
         else:
             assert actual_grad.shape == expected_grad.shape, index
+
+
+@requires_cuda
+@pytest.mark.parametrize("packed", [False, True])
+def test_trainer_triton_matches_torch_path_and_opcheck(monkeypatch, packed):
+    """The Triton training op agrees with the PyTorch path and is a well-formed custom op."""
+    if portable._triton_kernels is None:
+        pytest.skip("needs Triton")
+    torch.manual_seed(14)
+    channels, width = 1000, 4
+    if packed:
+        cu_seqlens = torch.tensor((0, 1, 1, 77, 300, 301), device="cuda", dtype=torch.int32)
+        x = torch.randn(1, 320, channels, device="cuda", dtype=torch.bfloat16)
+        x[:, 301:] = float("nan")
+        sequences, active = 5, 301
+    else:
+        cu_seqlens = None
+        x = torch.randn(3, 40, channels + 8, device="cuda", dtype=torch.bfloat16)[..., :channels]
+        sequences, active = 3, 40
+    weight = torch.randn(channels, width, device="cuda", dtype=torch.bfloat16)
+    state = torch.randn(sequences, width - 1, channels, device="cuda", dtype=torch.bfloat16)
+    grad_output = torch.randn(x.shape, device="cuda", dtype=torch.bfloat16)
+    results = []
+    for kernels in (portable._triton_kernels, None):
+        monkeypatch.setattr(portable, "_triton_kernels", kernels)
+        leaves = [tensor.detach().clone().requires_grad_() for tensor in (x, weight, state)]
+        output = causal_conv1d(
+            leaves[0], leaves[1], activation="silu", cu_seqlens=cu_seqlens, initial_state=leaves[2]
+        )
+        results.append((output[:, :active], *torch.autograd.grad(output, leaves, grad_output)))
+    for name, triton_value, torch_value in zip(
+        ("out", "dx", "dweight", "dstate"), *results, strict=True
+    ):
+        if name == "dx":
+            triton_value, torch_value = triton_value[:, :active], torch_value[:, :active]
+        assert torch.isfinite(triton_value).all(), name
+        assert _relative_error(triton_value, torch_value) < 2e-3, name
+    torch.library.opcheck(
+        torch.ops.attn_gym._portable_short_conv_fwd.default,
+        (
+            torch.randn(1, 37, 16, device="cuda", requires_grad=True),
+            torch.randn(16, width, device="cuda", requires_grad=True),
+            torch.tensor((0, 5, 37), device="cuda", dtype=torch.int32),
+            torch.randn(2, width - 1, 16, device="cuda", requires_grad=True),
+            "silu",
+        ),
+    )
 
 
 def test_kernel_options_are_validated_and_accepted():
@@ -289,7 +336,7 @@ def _paged_reference(x, weight, state, state_indices, has_initial_state, cu_seql
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("packed", [False, True])
-def test_paged_prefill_fresh_resumed_and_null_slots(packed, dtype, stateful_impl):
+def test_paged_prefill_fresh_resumed_and_null_slots(packed, dtype, impl):
     """Fresh slots ignore NaN history, null routes write nothing, page padding stays intact."""
     torch.manual_seed(5)
     channels, width = 12, 4
@@ -336,7 +383,7 @@ def test_paged_prefill_fresh_resumed_and_null_slots(packed, dtype, stateful_impl
     torch.testing.assert_close(storage.cpu(), expected_storage, rtol=0, atol=0, equal_nan=True)
 
 
-def test_paged_prefill_empty_fresh_and_resumed_slots(stateful_impl):
+def test_paged_prefill_empty_fresh_and_resumed_slots(impl):
     torch.manual_seed(6)
     x = torch.randn(1, 4, 12, device=DEVICE, dtype=torch.bfloat16)
     weight = torch.randn(12, 4, device=DEVICE, dtype=x.dtype)
@@ -377,7 +424,7 @@ def _decode_reference(x, weight, state, state_indices, has_initial_state, activa
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("activation", [None, "silu"])
 @pytest.mark.parametrize("width", [2, 4, 5])
-def test_decode_null_rows_fresh_rows_and_padded_pool(width, activation, dtype, stateful_impl):
+def test_decode_null_rows_fresh_rows_and_padded_pool(width, activation, dtype, impl):
     torch.manual_seed(7)
     channels = 20
     x = torch.randn(6, channels, device=DEVICE, dtype=dtype)
@@ -416,7 +463,7 @@ def test_decode_null_rows_fresh_rows_and_padded_pool(width, activation, dtype, s
         )
 
 
-def test_decode_implicit_slots_and_strided_rows(stateful_impl):
+def test_decode_implicit_slots_and_strided_rows(impl):
     torch.manual_seed(8)
     base = torch.randn(3, 40, device=DEVICE, dtype=torch.bfloat16)
     x = base[:, 8:24]
@@ -432,7 +479,7 @@ def test_decode_implicit_slots_and_strided_rows(stateful_impl):
     torch.testing.assert_close(state.cpu(), expected_state, rtol=0, atol=0)
 
 
-def test_prefill_continues_in_decode_like_one_long_prefill(stateful_impl):
+def test_prefill_continues_in_decode_like_one_long_prefill(impl):
     """Prefill a prefix, decode the remaining tokens, and match a single prefill of all."""
     torch.manual_seed(9)
     dtype, channels, width = torch.float32, 12, 4
@@ -510,7 +557,7 @@ def test_decode_triton_matches_torch_path(monkeypatch):
 
 
 @requires_cuda
-def test_decode_cuda_graph_replay_is_bitwise_eager(stateful_impl):
+def test_decode_cuda_graph_replay_is_bitwise_eager(impl):
     """Capture one decode step, then replay changed rows, routes, freshness, and history."""
     torch.manual_seed(10)
     dtype, channels, width, rows = torch.bfloat16, 64, 4, 8
@@ -588,7 +635,7 @@ def test_paged_prefill_triton_matches_torch_path(monkeypatch, packed):
 
 
 @requires_cuda
-def test_paged_prefill_cuda_graph_replays_boundaries_and_routing(stateful_impl):
+def test_paged_prefill_cuda_graph_replays_boundaries_and_routing(impl):
     torch.manual_seed(11)
     dtype, channels, width = torch.bfloat16, 12, 4
     x = torch.randn(1, 16, channels, device="cuda", dtype=dtype)

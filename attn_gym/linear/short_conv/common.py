@@ -153,6 +153,21 @@ def packed_final_conv_state(
     return torch.where(from_input[:, :, None], input_values, state_values)
 
 
+def packed_positions(
+    cu_seqlens: torch.Tensor, tokens: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return each physical token's packed sequence, offset in it, and whether it is active.
+
+    Repeated offsets (empty sequences) own no token. Tokens at or past the active endpoint
+    ``cu_seqlens[-1]`` are inactive and assigned to the last sequence.
+    """
+    positions = torch.arange(tokens, device=cu_seqlens.device, dtype=cu_seqlens.dtype)
+    sequence = torch.searchsorted(cu_seqlens[1:], positions, right=True)
+    sequence = sequence.clamp_(max=cu_seqlens.shape[0] - 2)
+    offset = positions.long() - cu_seqlens[sequence].long()
+    return sequence, offset, positions < cu_seqlens[-1]
+
+
 def final_conv_state(
     x: torch.Tensor,
     initial_state: torch.Tensor | None,
@@ -179,4 +194,5 @@ __all__ = [
     "dense_final_conv_state",
     "final_conv_state",
     "packed_final_conv_state",
+    "packed_positions",
 ]
