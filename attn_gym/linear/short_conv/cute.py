@@ -26,6 +26,7 @@ from typing import ClassVar, TypedDict
 import cutlass
 import torch
 from cuda.bindings import driver as cuda
+from cuda.pathfinder import DynamicLibNotFoundError, load_nvidia_dynamic_lib
 from cutlass import Float32, Int32, Int64, cute, pipeline
 from cutlass.cute.nvgpu import cpasync
 
@@ -47,6 +48,13 @@ from attn_gym.utils import cdiv
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_strided_tensor
 from attn_gym.warpdrive.compat import SmemAllocator
 from attn_gym.warpdrive.scheduling import BoundWork, OneShot, WorkStream
+
+try:
+    load_nvidia_dynamic_lib("cuda")
+except DynamicLibNotFoundError as error:
+    # CUTLASS DSL installs without the NVIDIA driver, but nothing here can launch then. Report
+    # the backend as missing so attn_gym.linear.short_conv resolves the portable one.
+    raise ModuleNotFoundError(str(error), name="cuda") from error
 
 ShortConvDType = CuteDType
 SHORT_CONV_DTYPES = {
