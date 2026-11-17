@@ -27,6 +27,7 @@ from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym._backends.triton.utils import (
     can_use_tensor_descriptor,
     ptr_offset,
+    reflect_ftz_option,
     requires_int64_offsets,
 )
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
@@ -539,7 +540,7 @@ def _delta_h_launch(
         ),
         "SCALAR_GATE": scalar_gate,
         "FASTMATH": fastmath,
-        "enable_reflect_ftz": fastmath,
+        **reflect_ftz_option(fastmath),
         "num_warps": 4,
     }
     value_tiles = value_dim // block_value_dim

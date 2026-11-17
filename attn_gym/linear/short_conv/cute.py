@@ -20,12 +20,12 @@ gradients and FP32 weight-gradient partials followed by a Torch reduction.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
-from typing import ClassVar, TypedDict
+from typing import ClassVar
 
 import cutlass
 import torch
 from cuda.bindings import driver as cuda
+from cuda.pathfinder import DynamicLibNotFoundError, load_nvidia_dynamic_lib
 from cutlass import Float32, Int32, Int64, cute, pipeline
 from cutlass.cute.nvgpu import cpasync
 
@@ -42,11 +42,27 @@ from attn_gym._backends.cute.utils import (
 from attn_gym._backends.tune import tune
 from attn_gym.linear.short_conv import ops as short_conv_ops
 from attn_gym.linear.short_conv.activations import Activation, resolve_activation
-from attn_gym.types import KernelOptionSpec, validate_kernel_options
+from attn_gym.linear.short_conv.common import (
+    DECODE_KERNEL_OPTION_SPEC,
+    KERNEL_OPTION_SPEC,
+    ShortConvConfig,
+    ShortConvDecodeKernelOptions,
+    ShortConvKernelOptions,
+    ShortConvTunedConfig,
+    final_conv_state,
+)
+from attn_gym.types import validate_kernel_options
 from attn_gym.utils import cdiv
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_strided_tensor
 from attn_gym.warpdrive.compat import SmemAllocator
 from attn_gym.warpdrive.scheduling import BoundWork, OneShot, WorkStream
+
+try:
+    load_nvidia_dynamic_lib("cuda")
+except DynamicLibNotFoundError as error:
+    # CUTLASS DSL installs without the NVIDIA driver, but nothing here can launch then. Report
+    # the backend as missing so attn_gym.linear.short_conv resolves the portable one.
+    raise ModuleNotFoundError(str(error), name="cuda") from error
 
 ShortConvDType = CuteDType
 SHORT_CONV_DTYPES = {
@@ -69,96 +85,6 @@ def _persistent_tma_dx_workers(
         get_device_properties(device).multi_processor_count * _PERSISTENT_TMA_DX_CTAS_PER_SM
     )
     return cdiv(device_workers, channel_blocks)
-
-
-@dataclass(frozen=True)
-class ShortConvConfig:
-    """Compile-time launch and register-tiling specialization."""
-
-    threads: int
-    channels_per_thread: int
-    times_per_block: int
-
-
-@dataclass(frozen=True)
-class ShortConvTunedConfig:
-    """Selected specializations for forward and both first-order gradients."""
-
-    forward: ShortConvConfig
-    input_gradient: ShortConvConfig
-    weight_gradient: ShortConvConfig
-
-    @classmethod
-    def default(
-        cls,
-        dtype: torch.dtype = torch.bfloat16,
-        *,
-        packed: bool = False,
-    ) -> ShortConvTunedConfig:
-        """Return measured GB300 defaults for one storage dtype and layout mode."""
-        match dtype:
-            case torch.float16 | torch.bfloat16:
-                forward = ShortConvConfig(128, 4, 16)
-                gradients = (
-                    (ShortConvConfig(128, 4, 16), ShortConvConfig(128, 2, 32))
-                    if packed
-                    else (ShortConvConfig(128, 2, 32), ShortConvConfig(128, 2, 64))
-                )
-            case torch.float32:
-                forward = ShortConvConfig(128, 4, 4)
-                gradients = (
-                    (ShortConvConfig(128, 2, 16), ShortConvConfig(128, 4, 32))
-                    if packed
-                    else (ShortConvConfig(128, 2, 12), ShortConvConfig(128, 2, 160))
-                )
-            case _:
-                raise ValueError(f"unsupported short-convolution dtype {dtype}")
-        return cls(forward, *gradients)
-
-    def kernel_options(self) -> ShortConvKernelOptions:
-        """Return these specializations as ``kernel_options`` for :func:`causal_conv1d`."""
-        return {
-            "forward_config": self.forward,
-            "input_grad_config": self.input_gradient,
-            "weight_grad_config": self.weight_gradient,
-        }
-
-
-class ShortConvDecodeKernelOptions(TypedDict, total=False):
-    """Kernel options of :func:`causal_conv1d_decode`."""
-
-    forward_config: ShortConvConfig
-    """Forward schedule specialization. Defaults to a measured schedule for the inputs and device."""
-
-
-class ShortConvKernelOptions(ShortConvDecodeKernelOptions, total=False):
-    """Kernel options of :func:`causal_conv1d`.
-
-    An absent schedule uses the measured default for the dtype and layout. The operation never
-    benchmarks on its own, so there is no ``autotune`` key; :func:`tune_causal_conv1d` selects
-    schedules explicitly.
-    """
-
-    input_grad_config: ShortConvConfig
-    """Input-gradient schedule specialization."""
-
-    weight_grad_config: ShortConvConfig
-    """Weight-gradient schedule specialization."""
-
-    persistent_tma_input_gradient: bool
-    """Use an explicit machine-bounded persistent worker grid for packed TMA input gradients.
-    Defaults to ``False`` because it favors overcaptured replays and can regress full-capacity
-    backward. Requires ``x``'s base and outer strides to be 16-byte aligned; backward raises
-    otherwise."""
-
-
-DECODE_KERNEL_OPTION_SPEC: KernelOptionSpec = {"forward_config": (ShortConvConfig, None)}
-KERNEL_OPTION_SPEC: KernelOptionSpec = {
-    **DECODE_KERNEL_OPTION_SPEC,
-    "input_grad_config": (ShortConvConfig, None),
-    "weight_grad_config": (ShortConvConfig, None),
-    "persistent_tma_input_gradient": (bool, False),
-}
 
 
 @cute.jit
@@ -4370,65 +4296,6 @@ def _validate_config(config: ShortConvConfig, channels: int, name: str) -> None:
         raise ValueError(f"C must be divisible by positive {name}.channels_per_thread")
     if config.times_per_block < 1:
         raise ValueError(f"{name}.times_per_block must be positive")
-
-
-def dense_final_conv_state(
-    x: torch.Tensor,
-    initial_state: torch.Tensor | None,
-    state_length: int,
-) -> torch.Tensor:
-    """Return the final dense history for a positive state length."""
-    if x.shape[1] >= state_length:
-        if initial_state is None:
-            return x[:, -state_length:].clone()
-        # Preserve the shaped zero gradient of replaced caller history.
-        return x[:, -state_length:] + initial_state[:, :0].sum()
-    prefix = (
-        x.new_zeros(x.shape[0], state_length - x.shape[1], x.shape[2])
-        if initial_state is None
-        else initial_state[:, x.shape[1] :]
-    )
-    return torch.cat((prefix, x), dim=1)
-
-
-def packed_final_conv_state(
-    x: torch.Tensor,
-    initial_state: torch.Tensor | None,
-    state_length: int,
-    cu_seqlens: torch.Tensor,
-) -> torch.Tensor:
-    """Gather final histories from packed sequences without host reads."""
-    starts = cu_seqlens[:-1].to(torch.int64)
-    ends = cu_seqlens[1:].to(torch.int64)
-    offsets = torch.arange(state_length, device=x.device)
-    positions = ends[:, None] - state_length + offsets
-    from_input = positions >= starts[:, None]
-    input_values = x[0, positions.clamp(0, x.shape[1] - 1)]
-    if initial_state is None:
-        state_values = torch.zeros_like(input_values)
-    else:
-        state_positions = (offsets + (ends - starts)[:, None]).clamp(0, state_length - 1)
-        state_values = initial_state.gather(
-            1,
-            state_positions[:, :, None].expand(-1, -1, x.shape[2]),
-        )
-    return torch.where(from_input[:, :, None], input_values, state_values)
-
-
-def final_conv_state(
-    x: torch.Tensor,
-    initial_state: torch.Tensor | None,
-    state_length: int,
-    cu_seqlens: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Return each sequence's final short history without copying the complete input."""
-    if state_length == 0:
-        num_sequences = x.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
-        final_state = x[:, :0].expand(num_sequences, -1, -1).clone()
-        return final_state if initial_state is None else final_state + initial_state
-    if cu_seqlens is None:
-        return dense_final_conv_state(x, initial_state, state_length)
-    return packed_final_conv_state(x, initial_state, state_length, cu_seqlens)
 
 
 def causal_conv1d(

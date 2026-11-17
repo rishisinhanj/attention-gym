@@ -9,31 +9,43 @@
 from __future__ import annotations
 
 import importlib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from types import ModuleType
 
 import torch
 
 
 def lazy_exports(
-    module_name: str, exports: Mapping[str, str], *, requirement: str
+    module_name: str, exports: Mapping[str, str | Sequence[str]], *, requirement: str
 ) -> Callable[[str], object]:
     """Return a module ``__getattr__`` that imports each export's owning module on first use.
 
-    ``exports`` maps a public name to the module that defines it. A missing optional dependency
-    surfaces as ``ImportError("<name> requires the optional <requirement>: pip install ...")``.
+    ``exports`` maps a public name to the module that defines it, or to modules in order of
+    preference: the first one that imports supplies the name, so a portable implementation can
+    stand behind an optional backend. The choice is made once per name. A missing optional
+    dependency surfaces as ``ImportError("<name> requires the optional <requirement>: pip install
+    ...")``, chained from the first module's error.
     """
+    chosen: dict[str, ModuleType] = {}
 
     def __getattr__(name: str) -> object:
-        owner = exports.get(name)
-        if owner is None:
+        owners = exports.get(name)
+        if owners is None:
             raise AttributeError(f"module {module_name!r} has no attribute {name!r}")
-        try:
-            module = importlib.import_module(owner)
-        except ImportError as error:
-            raise ImportError(
-                f"{name} requires the optional {requirement}: pip install attn-gym[linear]"
-            ) from error
+        module = chosen.get(name)
+        if module is None:
+            errors: list[ImportError] = []
+            for owner in (owners,) if isinstance(owners, str) else owners:
+                try:
+                    module = importlib.import_module(owner)
+                    break
+                except ImportError as error:
+                    errors.append(error)
+            else:
+                raise ImportError(
+                    f"{name} requires the optional {requirement}: pip install attn-gym[linear]"
+                ) from errors[0]
+            chosen[name] = module
         return getattr(module, name)
 
     return __getattr__

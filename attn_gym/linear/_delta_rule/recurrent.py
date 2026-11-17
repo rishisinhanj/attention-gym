@@ -45,8 +45,9 @@ configure_triton_allocator()
 # (GB200, H=16, K=V=128) and differed only among shorter scans.
 _TOKENS_BUCKET_LIMIT = 64
 
-# Register cap of pinned one-warp launches; see `_pinned_launch_options`.
-_ONE_WARP_MAXNREG = 128
+# Register cap of pinned one-warp launches; see `_pinned_launch_options`. Triton's HIP backend
+# has no ``maxnreg`` launch option, so ROCm launches every tile uncapped.
+_ONE_WARP_MAXNREG = None if torch.version.hip else 128
 
 _RECURRENT_TUNING_ARGS = (
     "N",
@@ -310,7 +311,9 @@ _recurrent_scan = TritonTuner(
         triton.Config({"BV": block_v}, num_warps=num_warps, num_stages=3, maxnreg=maxnreg)
         for block_v in (32, 16, 8, 4, 2, 1)
         for num_warps in (1, 2, 4)
-        for maxnreg in ((None, _ONE_WARP_MAXNREG) if num_warps == 1 else (None,))
+        for maxnreg in (
+            (None, _ONE_WARP_MAXNREG) if num_warps == 1 and _ONE_WARP_MAXNREG else (None,)
+        )
     ],
     key=_recurrent_tuning_key,
     prune=_prune_recurrent_configs,

@@ -23,8 +23,9 @@ from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
 
 # Match FLA's fused GDN solve: the block-inverse merge multiplies FP32 intermediates,
 # so TF32 preserves more precision than narrowing them to BF16 while retaining tensor-core MMAs.
-# This setting does not change the public FP16/BF16 QKV contract.
-SOLVE_TRIL_DOT_PRECISION = tl.constexpr("tf32")
+# This setting does not change the public FP16/BF16 QKV contract. Triton's HIP backend rejects
+# TF32 on gfx950 (it has no XF32 MFMA), so ROCm runs these dots in IEEE FP32.
+SOLVE_TRIL_DOT_PRECISION = tl.constexpr("ieee" if torch.version.hip else "tf32")
 
 
 @triton.jit
