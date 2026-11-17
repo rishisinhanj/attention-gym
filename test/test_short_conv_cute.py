@@ -12,6 +12,8 @@ import torch
 import torch.nn.functional as F
 
 pytest.importorskip("cutlass")
+# The backend also needs the NVIDIA driver; elsewhere the portable backend serves short_conv.
+pytest.importorskip("attn_gym.linear.short_conv.cute")
 
 import attn_gym.linear.short_conv.cute as cute_backend
 from attn_gym.linear.short_conv import activations
