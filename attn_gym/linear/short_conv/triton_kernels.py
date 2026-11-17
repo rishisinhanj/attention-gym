@@ -48,7 +48,7 @@ def _causal_conv1d_decode_kernel(
         live = row >= 0
     resumed = live
     if MASKED:
-        resumed = resumed & tl.load(has_initial_state + row)
+        resumed = resumed & (tl.load(has_initial_state + row) != 0)
     history = state + slot * state_slot_stride + channel
     taps = weight + channel * WIDTH
     newest = tl.load(x + row * x_row_stride + channel, mask=in_range & live, other=0.0)
@@ -78,7 +78,7 @@ def _token_tile(
     if PACKED:
         owner = tl.load(sequence + token, mask=token_in, other=0)
         position = tl.load(offset + token, mask=token_in, other=0)
-        in_use = token_in & tl.load(active + token, mask=token_in, other=0)
+        in_use = token_in & (tl.load(active + token, mask=token_in, other=0) != 0)
     else:
         owner = tl.zeros([BLOCK_T], dtype=tl.int64) + batch
         position = token
@@ -155,7 +155,7 @@ def _causal_conv1d_forward_kernel(
     )
     routed = in_use
     if ROUTED:
-        routed = in_use & tl.load(live + owner, mask=token_in, other=0)
+        routed = in_use & (tl.load(live + owner, mask=token_in, other=0) != 0)
     rows = x + batch * x_batch_stride + channel[None, :]
     value = tl.zeros([BLOCK_T, BLOCK_C], dtype=tl.float32)
     for shift in tl.static_range(WIDTH):
@@ -246,7 +246,7 @@ def _causal_conv1d_backward_kernel(
 def _forward_launch(x, weight, output, upstream, history, live, positions, activation):
     batches, tokens, channels = x.shape
     block_t, block_c = 32, min(128, triton.next_power_of_2(channels))
-    sequence, offset, active = (output, output, output) if positions is None else positions
+    sequence, offset, active = (None, None, None) if positions is None else positions
     grid = (triton.cdiv(tokens, block_t), triton.cdiv(channels, block_c), batches)
     _causal_conv1d_forward_kernel[grid](
         x,
@@ -254,9 +254,9 @@ def _forward_launch(x, weight, output, upstream, history, live, positions, activ
         x.stride(1),
         weight,
         output,
-        output if upstream is None else upstream,
-        output if history is None else history,
-        output if live is None else live,
+        upstream,
+        history,
+        live,
         sequence,
         offset,
         active,
@@ -366,7 +366,7 @@ def short_conv_backward(
     partials = torch.empty(
         batches * blocks, width, channels, device=x.device, dtype=torch.float32
     )
-    sequence, offset, active = (grad_x, grad_x, grad_x) if positions is None else positions
+    sequence, offset, active = (None, None, None) if positions is None else positions
     _causal_conv1d_backward_kernel[(blocks, triton.cdiv(channels, block_c), batches)](
         x,
         x.stride(0),
@@ -375,7 +375,7 @@ def short_conv_backward(
         preactivation_grad,
         grad_x,
         partials,
-        grad_x if initial_state is None else initial_state,
+        initial_state,
         sequence,
         offset,
         active,
@@ -442,8 +442,8 @@ def causal_conv1d_decode(
         output,
         state,
         state.stride(0),
-        output if state_indices is None else state_indices,
-        output if has_initial_state is None else has_initial_state,
+        state_indices,
+        has_initial_state,
         channels,
         WIDTH=weight.shape[1],
         BLOCK=block,

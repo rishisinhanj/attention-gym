@@ -670,6 +670,66 @@ def test_paged_prefill_cuda_graph_replays_boundaries_and_routing(impl):
     torch.testing.assert_close(state, eager_state, rtol=0, atol=0)
 
 
+@requires_cuda
+@pytest.mark.parametrize("packed", [False, True])
+def test_fullgraph_compile_matches_eager(impl, packed):
+    """Compiled graphs launch the same kernels on the same buffers as eager calls."""
+    torch._dynamo.reset()
+    torch.manual_seed(15)
+    channels, width = 96, 4
+    weight = torch.randn(channels, width, device="cuda", dtype=torch.bfloat16)
+    if packed:
+        cu_seqlens = torch.tensor((0, 3, 3, 30), device="cuda", dtype=torch.int32)
+        x = torch.randn(1, 40, channels, device="cuda", dtype=torch.bfloat16)
+        active, sequences = 30, 3
+    else:
+        cu_seqlens = None
+        x = torch.randn(3, 9, channels, device="cuda", dtype=torch.bfloat16)
+        active, sequences = 9, 3
+    slots = torch.tensor((2, 0, 5), device="cuda", dtype=torch.int32)
+    fresh = torch.tensor((False, True, True), device="cuda")
+    pool = torch.randn(7, width - 1, channels, device="cuda", dtype=torch.bfloat16)
+    rows = torch.randn(3, channels, device="cuda", dtype=torch.bfloat16)
+
+    def prefill(pool):
+        return paged_causal_conv1d(
+            x, weight, pool, slots, activation="silu", cu_seqlens=cu_seqlens,
+            has_initial_state=fresh,
+        )
+
+    def decode(pool):
+        return causal_conv1d_decode(
+            rows, weight, pool, activation="silu", state_indices=slots, has_initial_state=fresh
+        )
+
+    with torch.no_grad():
+        for run in (prefill, decode):
+            eager_pool, compiled_pool = pool.clone(), pool.clone()
+            eager = run(eager_pool)
+            compiled = torch.compile(run, fullgraph=True)(compiled_pool)
+            if eager.ndim == 3:
+                eager, compiled = eager[:, :active], compiled[:, :active]
+            torch.testing.assert_close(compiled, eager, rtol=0, atol=0)
+            torch.testing.assert_close(compiled_pool, eager_pool, rtol=0, atol=0)
+
+    state = torch.randn(sequences, width - 1, channels, device="cuda", dtype=torch.bfloat16)
+
+    def train(*leaves):
+        return causal_conv1d(
+            leaves[0], leaves[1], activation="silu", cu_seqlens=cu_seqlens, initial_state=leaves[2]
+        )
+
+    grad_output = torch.randn(x.shape, device="cuda", dtype=torch.bfloat16)
+    results = []
+    for run in (train, torch.compile(train, fullgraph=True)):
+        leaves = [tensor.clone().requires_grad_() for tensor in (x, weight, state)]
+        output = run(*leaves)
+        grads = torch.autograd.grad(output, leaves, grad_output)
+        results.append((output[:, :active], grads[0][:, :active], *grads[1:]))
+    for compiled, eager in zip(results[1], results[0], strict=True):
+        torch.testing.assert_close(compiled, eager, rtol=0, atol=1e-4)
+
+
 def test_stateful_operations_reject_autograd_and_malformed_inputs():
     x, weight = _inputs(1, 4, 12, 4, torch.bfloat16)
     state = torch.randn(4, 3, 12, device=DEVICE, dtype=x.dtype)
