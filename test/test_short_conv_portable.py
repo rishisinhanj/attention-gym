@@ -30,6 +30,16 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 
 RELATIVE_BUDGET = {torch.float16: 2e-3, torch.bfloat16: 1e-2, torch.float32: 1e-5}
 
 
+@pytest.fixture(params=["torch", "triton"])
+def stateful_impl(request, monkeypatch):
+    """Run paged prefill and decode through the PyTorch path or the GPU path's Triton kernels."""
+    if request.param == "torch":
+        monkeypatch.setattr(portable, "_triton_kernels", None)
+    elif DEVICE != "cuda" or portable._triton_kernels is None:
+        pytest.skip("the Triton kernels need a GPU and Triton")
+    return request.param
+
+
 def _relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
     actual, expected = actual.double(), expected.double()
     return ((actual - expected).norm() / expected.norm().clamp_min(1e-30)).item()
@@ -279,7 +289,7 @@ def _paged_reference(x, weight, state, state_indices, has_initial_state, cu_seql
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("packed", [False, True])
-def test_paged_prefill_fresh_resumed_and_null_slots(packed, dtype):
+def test_paged_prefill_fresh_resumed_and_null_slots(packed, dtype, stateful_impl):
     """Fresh slots ignore NaN history, null routes write nothing, page padding stays intact."""
     torch.manual_seed(5)
     channels, width = 12, 4
@@ -326,7 +336,7 @@ def test_paged_prefill_fresh_resumed_and_null_slots(packed, dtype):
     torch.testing.assert_close(storage.cpu(), expected_storage, rtol=0, atol=0, equal_nan=True)
 
 
-def test_paged_prefill_empty_fresh_and_resumed_slots():
+def test_paged_prefill_empty_fresh_and_resumed_slots(stateful_impl):
     torch.manual_seed(6)
     x = torch.randn(1, 4, 12, device=DEVICE, dtype=torch.bfloat16)
     weight = torch.randn(12, 4, device=DEVICE, dtype=x.dtype)
@@ -367,7 +377,7 @@ def _decode_reference(x, weight, state, state_indices, has_initial_state, activa
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("activation", [None, "silu"])
 @pytest.mark.parametrize("width", [2, 4, 5])
-def test_decode_null_rows_fresh_rows_and_padded_pool(width, activation, dtype):
+def test_decode_null_rows_fresh_rows_and_padded_pool(width, activation, dtype, stateful_impl):
     torch.manual_seed(7)
     channels = 20
     x = torch.randn(6, channels, device=DEVICE, dtype=dtype)
@@ -406,7 +416,7 @@ def test_decode_null_rows_fresh_rows_and_padded_pool(width, activation, dtype):
         )
 
 
-def test_decode_implicit_slots_and_strided_rows():
+def test_decode_implicit_slots_and_strided_rows(stateful_impl):
     torch.manual_seed(8)
     base = torch.randn(3, 40, device=DEVICE, dtype=torch.bfloat16)
     x = base[:, 8:24]
@@ -422,7 +432,7 @@ def test_decode_implicit_slots_and_strided_rows():
     torch.testing.assert_close(state.cpu(), expected_state, rtol=0, atol=0)
 
 
-def test_prefill_continues_in_decode_like_one_long_prefill():
+def test_prefill_continues_in_decode_like_one_long_prefill(stateful_impl):
     """Prefill a prefix, decode the remaining tokens, and match a single prefill of all."""
     torch.manual_seed(9)
     dtype, channels, width = torch.float32, 12, 4
@@ -472,7 +482,35 @@ def test_prefill_continues_in_decode_like_one_long_prefill():
 
 
 @requires_cuda
-def test_decode_cuda_graph_replay_is_bitwise_eager():
+def test_decode_triton_matches_torch_path(monkeypatch):
+    """Both decode paths advance the pool identically and agree on outputs to FP32 rounding."""
+    if portable._triton_kernels is None:
+        pytest.skip("needs Triton")
+    torch.manual_seed(12)
+    x = torch.randn(64, 8192, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(8192, 4, device="cuda", dtype=torch.bfloat16)
+    state = torch.randn(80, 3, 8192, device="cuda", dtype=torch.bfloat16)
+    state_indices = (torch.randperm(79, device="cuda")[:64] + 1).to(torch.int32)
+    state_indices[::7] = 0
+    mask = torch.rand(64, device="cuda") < 0.8
+    triton_state, torch_state = state.clone(), state.clone()
+    with torch.no_grad():
+        triton_output = causal_conv1d_decode(
+            x, weight, triton_state, activation="silu", state_indices=state_indices,
+            has_initial_state=mask,
+        )
+        monkeypatch.setattr(portable, "_triton_kernels", None)
+        torch_output = causal_conv1d_decode(
+            x, weight, torch_state, activation="silu", state_indices=state_indices,
+            has_initial_state=mask,
+        )
+    torch.testing.assert_close(triton_state, torch_state, rtol=0, atol=0)
+    torch.testing.assert_close(triton_output, torch_output, rtol=1.6e-2, atol=1e-5)
+    assert _relative_error(triton_output, torch_output) < 1e-3
+
+
+@requires_cuda
+def test_decode_cuda_graph_replay_is_bitwise_eager(stateful_impl):
     """Capture one decode step, then replay changed rows, routes, freshness, and history."""
     torch.manual_seed(10)
     dtype, channels, width, rows = torch.bfloat16, 64, 4, 8
@@ -513,7 +551,44 @@ def test_decode_cuda_graph_replay_is_bitwise_eager():
 
 
 @requires_cuda
-def test_paged_prefill_cuda_graph_replays_boundaries_and_routing():
+@pytest.mark.parametrize("packed", [False, True])
+def test_paged_prefill_triton_matches_torch_path(monkeypatch, packed):
+    if portable._triton_kernels is None:
+        pytest.skip("needs Triton")
+    torch.manual_seed(13)
+    channels, width = 1000, 4
+    if packed:
+        cu_seqlens = torch.tensor((0, 1, 1, 77, 300, 301), device="cuda", dtype=torch.int32)
+        x = torch.randn(1, 320, channels, device="cuda", dtype=torch.bfloat16)
+        x[:, 301:] = float("nan")
+        routes, active = (3, 0, 9, 4, -1), 301
+    else:
+        cu_seqlens = None
+        x = torch.randn(6, 40, channels + 8, device="cuda", dtype=torch.bfloat16)[..., :channels]
+        routes, active = (3, 0, 9, 4, -1, 2), 40
+    state_indices = torch.tensor(routes, device="cuda", dtype=torch.int32)
+    has_initial_state = torch.tensor([n % 2 == 0 for n in range(len(routes))], device="cuda")
+    weight = torch.randn(channels, width, device="cuda", dtype=torch.bfloat16)
+    state = torch.randn(10, width - 1, channels, device="cuda", dtype=torch.bfloat16)
+    outputs, states = [], []
+    for kernels in (portable._triton_kernels, None):
+        monkeypatch.setattr(portable, "_triton_kernels", kernels)
+        pool = state.clone()
+        with torch.no_grad():
+            outputs.append(
+                paged_causal_conv1d(
+                    x, weight, pool, state_indices, activation="silu", cu_seqlens=cu_seqlens,
+                    has_initial_state=has_initial_state,
+                )[:, :active]
+            )
+        states.append(pool)
+    torch.testing.assert_close(states[0], states[1], rtol=0, atol=0)
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=1.6e-2, atol=1e-5)
+    assert _relative_error(outputs[0], outputs[1]) < 1e-3
+
+
+@requires_cuda
+def test_paged_prefill_cuda_graph_replays_boundaries_and_routing(stateful_impl):
     torch.manual_seed(11)
     dtype, channels, width = torch.bfloat16, 12, 4
     x = torch.randn(1, 16, channels, device="cuda", dtype=dtype)

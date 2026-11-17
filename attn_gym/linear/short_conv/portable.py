@@ -15,7 +15,9 @@ same results, histories, and in-place state updates, on any device PyTorch suppo
 * :func:`causal_conv1d` differentiates through autograd, including the weight and initial-state
   gradients;
 * paged prefill and decode read slot routing, freshness, and packed boundaries on the device
-  and never synchronize with the host, so CUDA Graphs capture them and replay changed metadata.
+  and never synchronize with the host, so CUDA Graphs capture them and replay changed metadata;
+* on GPUs, where Triton imports, decode and the paged prefill convolution are Triton kernels
+  (``triton_kernels``); training keeps the differentiable PyTorch path.
 
 Only the built-in activations exist here: :func:`register_activation` takes CuTeDSL
 expressions. ``kernel_options`` schedules are validated as CuTeDSL validates them and otherwise
@@ -39,6 +41,11 @@ from attn_gym.linear.short_conv.common import (
     final_conv_state,
 )
 from attn_gym.types import validate_kernel_options
+
+try:
+    from attn_gym.linear.short_conv import triton_kernels as _triton_kernels
+except ImportError:
+    _triton_kernels = None
 
 SHORT_CONV_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
@@ -348,14 +355,16 @@ def paged_causal_conv1d(
     history = state_cache[slots]
     resumed = live if has_initial_state is None else live & has_initial_state
     initial_state = torch.where(resumed[:, None, None], history, 0)
-    if cu_seqlens is None:
-        positions = None
-        owned = live[:, None, None]
+    positions = None if cu_seqlens is None else _packed_positions(cu_seqlens, tokens)
+    # The Triton grid puts dense rows on its z axis, which holds at most 65535 blocks.
+    if _triton_kernels is not None and x.is_cuda and x.shape[0] <= 65535:
+        output = _triton_kernels.causal_conv1d_forward(
+            x, weight, initial_state, live, positions, activation
+        )
     else:
-        positions = _packed_positions(cu_seqlens, tokens)
-        owned = live[positions[0]][None, :, None]
-    output = epilogue(_preactivation(x, weight, cu_seqlens, initial_state, positions))
-    output = torch.where(owned, output, 0.0).to(x.dtype)
+        owned = live[:, None, None] if positions is None else live[positions[0]][None, :, None]
+        output = epilogue(_preactivation(x, weight, cu_seqlens, initial_state, positions))
+        output = torch.where(owned, output, 0.0).to(x.dtype)
     if cu_seqlens is None and tokens >= width - 1:
         # Copy the newest inputs: final_conv_state's autograd zero would turn -0.0 into +0.0.
         final_state = x[:, tokens - width + 1 :]
@@ -392,6 +401,10 @@ def causal_conv1d_decode(
     _reject_autograd("causal_conv1d_decode", x, weight, state)
     if options["forward_config"] is not None:
         _validate_config(options["forward_config"], x.shape[1], "forward_config")
+    if _triton_kernels is not None and x.is_cuda:
+        return _triton_kernels.causal_conv1d_decode(
+            x, weight, state, state_indices, has_initial_state, activation
+        )
     width = weight.shape[1]
     if state_indices is None:
         live = slots = None
