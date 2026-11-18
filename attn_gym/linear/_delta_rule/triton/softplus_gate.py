@@ -27,7 +27,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from attn_gym._backends.triton.utils import LN_2, LOG2_E, ptr_offset
+from attn_gym._backends.triton.utils import LN_2, LOG2_E, ptr_offset, reflect_ftz_option
 
 # Matches ``torch.nn.functional.softplus``: above this input the identity is exact in FP32.
 SOFTPLUS_THRESHOLD = tl.constexpr(20.0)
@@ -49,15 +49,21 @@ MAX_BLOCK_CHANNELS = 256
 # of -1, not 0), so below ``SMALL_TAIL`` the tail uses its series ``e - e^2/2`` (relative error
 # ``e^2/3 < 1e-5``). With that branch the absolute error matches FP32 eager (~6e-7 on N(0, 4)
 # inputs). ``tl.log2`` is not a shortcut here: Triton lowers it to a polynomial, not
-# ``lg2.approx``.
+# ``lg2.approx``. HIP's libdevice has no ``fast_log2f``; there ``tl.log2`` lowers to the hardware
+# ``v_log_f32``.
 SMALL_TAIL = tl.constexpr(2.0**-8)
+IS_HIP = tl.constexpr(torch.version.hip is not None)
 
 
 @triton.jit
 def _softplus(s, FASTMATH: tl.constexpr):
     if FASTMATH:  # See NOTE [Fastmath Softplus]
         e = tl.exp2(-tl.abs(s) * LOG2_E)
-        tail = tl.where(e < SMALL_TAIL, e - 0.5 * e * e, libdevice.fast_log2f(1.0 + e) * LN_2)
+        if IS_HIP:
+            log2_one_plus_e = tl.log2(1.0 + e)
+        else:
+            log2_one_plus_e = libdevice.fast_log2f(1.0 + e)
+        tail = tl.where(e < SMALL_TAIL, e - 0.5 * e * e, log2_one_plus_e * LN_2)
         return tl.maximum(s, 0.0) + tail
     return tl.where(s > SOFTPLUS_THRESHOLD, s, libdevice.log1p(libdevice.exp(s)))
 
@@ -279,7 +285,7 @@ def _softplus_gate_fwd_cuda(
         BLOCK_ROWS=block_rows,
         BLOCK_C=block_channels,
         FASTMATH=fastmath,
-        enable_reflect_ftz=fastmath,
+        **reflect_ftz_option(fastmath),
         num_warps=num_warps,
     )
     return gate.view(shape)
@@ -331,7 +337,7 @@ def _softplus_gate_bwd_cuda(
         BLOCK_ROWS=block_rows,
         BLOCK_C=block_channels,
         FASTMATH=fastmath,
-        enable_reflect_ftz=fastmath,
+        **reflect_ftz_option(fastmath),
         num_warps=num_warps,
     )
     d_dt_bias, d_A_log_channels = partials.sum(1)
