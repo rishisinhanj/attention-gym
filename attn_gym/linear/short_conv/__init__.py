@@ -29,14 +29,17 @@ if TYPE_CHECKING:
         tune_causal_conv1d,
     )
 
+# The PyTorch backend serves the operations wherever the CuTeDSL one does not import.
+_CONVOLUTION_BACKENDS = ("attn_gym.linear.short_conv.cute", "attn_gym.linear.short_conv.portable")
+
 _BACKEND_EXPORTS = {
     "ShortConvConfig": "attn_gym.linear.short_conv.cute",
     "ShortConvDecodeKernelOptions": "attn_gym.linear.short_conv.cute",
     "ShortConvKernelOptions": "attn_gym.linear.short_conv.cute",
     "ShortConvTunedConfig": "attn_gym.linear.short_conv.cute",
-    "causal_conv1d": "attn_gym.linear.short_conv.cute",
-    "causal_conv1d_decode": "attn_gym.linear.short_conv.cute",
-    "paged_causal_conv1d": "attn_gym.linear.short_conv.cute",
+    "causal_conv1d": _CONVOLUTION_BACKENDS,
+    "causal_conv1d_decode": _CONVOLUTION_BACKENDS,
+    "paged_causal_conv1d": _CONVOLUTION_BACKENDS,
     "register_activation": "attn_gym.linear.short_conv.activations",
     "tune_causal_conv1d": "attn_gym.linear.short_conv.cute",
 }
